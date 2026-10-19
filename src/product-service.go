@@ -1,12 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Product struct {
@@ -24,6 +30,14 @@ type ErrorResponse struct {
 	Details string `json:"details,omitempty"`
 }
 
+type RequestLog struct {
+	Timestamp  string  `json:"timestamp"`
+	Method     string  `json:"method"`
+	Endpoint   string  `json:"endpoint"`
+	StatusCode int     `json:"status_code"`
+	DurationMs float64 `json:"duration_ms"`
+}
+
 var (
 	products = map[int]Product{
 		1: {ProductID: 1, SKU: "ABC-123-XYZ", Manufacturer: "Acme Corporation", CategoryID: 10, Weight: 1250, SomeOtherID: 100},
@@ -31,13 +45,85 @@ var (
 		3: {ProductID: 3, SKU: "GHI-789-RST", Manufacturer: "Initech", CategoryID: 30, Weight: 750, SomeOtherID: 300},
 	}
 	mu sync.RWMutex
+
+	// Prometheus metrics
+	requestCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Total number of HTTP requests",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+
+	errorCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "http_errors_total",
+			Help: "Total number of non-2xx HTTP responses",
+		},
+		[]string{"method", "endpoint", "status"},
+	)
+
+	requestDuration = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "HTTP request duration in seconds",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"method", "endpoint"},
+	)
+
+	logger = log.New(os.Stdout, "", 0)
 )
 
+func init() {
+	prometheus.MustRegister(requestCounter)
+	prometheus.MustRegister(errorCounter)
+	prometheus.MustRegister(requestDuration)
+}
+
+func metricsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+
+		c.Next()
+
+		duration := time.Since(start)
+		status := strconv.Itoa(c.Writer.Status())
+		method := c.Request.Method
+		endpoint := c.FullPath()
+		if endpoint == "" {
+			endpoint = c.Request.URL.Path
+		}
+
+		// Prometheus metrics
+		requestCounter.WithLabelValues(method, endpoint, status).Inc()
+		requestDuration.WithLabelValues(method, endpoint).Observe(duration.Seconds())
+
+		if c.Writer.Status() >= 400 {
+			errorCounter.WithLabelValues(method, endpoint, status).Inc()
+		}
+
+		// Structured JSON log
+		logEntry := RequestLog{
+			Timestamp:  time.Now().UTC().Format(time.RFC3339),
+			Method:     method,
+			Endpoint:   endpoint,
+			StatusCode: c.Writer.Status(),
+			DurationMs: float64(duration.Microseconds()) / 1000.0,
+		}
+		logJSON, _ := json.Marshal(logEntry)
+		logger.Println(string(logJSON))
+	}
+}
+
 func main() {
-	r := gin.Default()
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(metricsMiddleware())
 
 	r.GET("/products/:productId", getProduct)
 	r.POST("/products/:productId/details", addProductDetails)
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	fmt.Println("Product service listening on :8080")
 	r.Run(":8080")
@@ -93,7 +179,6 @@ func addProductDetails(c *gin.Context) {
 		return
 	}
 
-	// Validate required fields
 	if input.SKU == "" {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "INVALID_INPUT",
@@ -151,7 +236,6 @@ func addProductDetails(c *gin.Context) {
 		return
 	}
 
-	// Check if URL productId matches body product_id
 	if input.ProductID != 0 && input.ProductID != id {
 		c.JSON(http.StatusBadRequest, ErrorResponse{
 			Error:   "INVALID_INPUT",
